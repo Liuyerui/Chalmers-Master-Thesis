@@ -1,5 +1,6 @@
 %% ----- helpers -----
-numLearnables = @(dlnet) sum(cellfun(@numel, dlnet.Learnables.Value));
+numLearnables = @(dlnet) sum(cellfun(@numel, dlnet.Learnables.Value)); % 统计一个 dlnetwork 里所有可训练参数（权重+偏置）
+% 的总数，用来后面对比"压缩前后参数量"。
 to_dlnet = @(net_) localToDLNetwork(net_);            % strips regression layer if present
 ctb = @(C) dlarray(cat(3, C{:}), "CTB");              % [F x W x N] → dlarray
 stableRMSE = @(y,yhat) sqrt(mean((y(:)-yhat(:)).^2));
@@ -237,6 +238,7 @@ save(fullfile('models','DLmodel_LSTM_stepA_projected.mat'), ...
 % save_system('StepA_model', fullfile('models','StepA_model.slx'));
 
 %% ===== local functions (file-end) =====
+% real prunning and quantization part of the entire code
 
 function [stats, best] = sweepCompress(dlnet, npca, goals, predictFcn, Ytest, rmse_base)
     n = numel(goals);
