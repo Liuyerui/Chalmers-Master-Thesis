@@ -1,0 +1,284 @@
+%% ----- helpers -----
+numLearnables = @(dlnet) sum(cellfun(@numel, dlnet.Learnables.Value)); @
+to_dlnet = @(net_) localToDLNetwork(net_);            % strips regression layer if present
+ctb = @(C) dlarray(cat(3, C{:}), "CTB");              % [F x W x N] → dlarray
+stableRMSE = @(y,yhat) sqrt(mean((y(:)-yhat(:)).^2));
+stableMAE  = @(y,yhat) mean(abs(y(:)-yhat(:)));
+stableMAPE = @(y,yhat) mean(abs((y(:)-yhat(:)) ./ max(abs(y(:)), 1e-8)));
+
+% Build (File,Cycle)->idx map aligned to sequence arrays length N
+function M = localIndexMap(infoStruct, N)
+    fsrc = asStrCol(infoStruct,'File');
+    csrc = asDblCol(infoStruct,'CycleTarget');
+
+    files  = strings(1,N);
+    cycles = nan(1,N);
+
+    for i = 1:N
+        if i <= numel(fsrc)
+            files(i) = fsrc(i);
+        else
+            files(i) = "";
+        end
+
+        if i <= numel(csrc)
+            cycles(i) = csrc(i);
+        else
+            cycles(i) = NaN;
+        end
+    end
+
+    M = containers.Map('KeyType','char','ValueType','double');
+    for i = 1:N
+        if files(i) ~= "" && ~isnan(cycles(i))
+            key = sprintf('%s#%d', files(i), round(cycles(i)));
+            M(key) = i;
+        end
+    end
+end
+
+
+% Rebuild GT prev_true for AR channel on TRAIN/VAL; returns vector + stats
+function [prev_vec, mu_p, sg_p] = localBuildPrevTrue(infoStruct, Y, N, mu_p_in, sg_p_in)
+    files  = asStrCol(infoStruct,'File');
+    cycles = asDblCol(infoStruct,'CycleTarget');
+    M = localIndexMap(infoStruct, N);
+
+    prev_vec = ones(N,1);
+
+    for i = 1:N
+        if i <= numel(files)
+            f = files(i);
+        else
+            f = "";
+        end
+
+        if i <= numel(cycles)
+            c = cycles(i);
+        else
+            c = NaN;
+        end
+
+        if f ~= "" && ~isnan(c)
+            keyPrev = sprintf('%s#%d', f, round(c-1));
+        else
+            keyPrev = "";
+        end
+
+        if keyPrev ~= "" && isKey(M, keyPrev)
+            j = M(keyPrev);
+            if j >= 1 && j <= numel(Y)
+                prev_vec(i) = Y(j);
+            end
+        end
+    end
+
+    % Use provided stats if available; otherwise compute from TRAIN
+    if nargin >= 4 && ~isempty(mu_p_in) && ~isempty(sg_p_in)
+        mu_p = mu_p_in;
+        sg_p = sg_p_in;
+    else
+        mu_p = mean(prev_vec, 'omitnan');
+        sg_p = std(prev_vec, 0, 'omitnan');
+    end
+
+    if sg_p == 0
+        sg_p = 1;
+    end
+end
+
+% Augment cell sequences with normalized scalar AR channel repeated over time
+function Xtf = localAugmentAR(Xcell, prev_vec, mu_p, sg_p)
+    normPrev = (prev_vec - mu_p) ./ sg_p;
+    Xtf = cellfun(@(X,p) [X; repmat(p,1,size(X,2))], Xcell, num2cell(normPrev), 'uni', 0);
+end
+
+% Roll-forward prediction for Step B (AR): uses (File,Cycle) ordering in infoTe
+function yhat = localRollForwardAR(dlnetTF, Xte, infoTe, mu_p, sg_p)
+    filesTe  = asStrCol(infoTe,'File');
+    cyclesTe = asDblCol(infoTe,'CycleTarget');
+    Mte = min([numel(Xte), numel(filesTe), numel(cyclesTe)]);
+    if Mte == 0
+        error('No TEST metadata to order roll-forward.');
+    end
+
+    Tord = table(filesTe(1:Mte), cyclesTe(1:Mte), 'VariableNames', {'f','c'});
+    [~, ord] = sortrows(Tord, {'f','c'});
+
+    lastPred = containers.Map('KeyType','char','ValueType','double');
+    yhat = zeros(numel(Xte),1);
+
+    for k = 1:numel(ord)
+        ii = ord(k);
+        f = filesTe(ii);
+        c = cyclesTe(ii);
+
+        if f ~= "" && ~isnan(c)
+            keyPrev = sprintf('%s#%d', f, round(c-1));
+        else
+            keyPrev = "";
+        end
+
+        pp = 1.0;
+        if keyPrev ~= "" && isKey(lastPred, keyPrev)
+            pp = lastPred(keyPrev);
+        end
+
+        pnorm = (pp - mu_p) / max(sg_p, eps);
+        Xi = Xte{ii};
+        X_aug = [Xi; repmat(pnorm, 1, size(Xi,2))];
+
+        yi = predict(dlnetTF, dlarray(X_aug, "CTB"));
+        yi = extractdata(reshape(yi, [], 1));
+        yhat(ii) = yi;
+
+        if f ~= "" && ~isnan(c)
+            lastPred(sprintf('%s#%d', f, round(c))) = yi;
+        end
+    end
+end
+
+
+function dln = localToDLNetwork(trainedNet)
+    % make layerGraph, drop regression layers, wrap into dlnetwork
+    try
+        lgraph = layerGraph(trainedNet.Layers);
+    catch
+        lgraph = layerGraph(trainedNet);
+    end
+    regIdx = find(arrayfun(@(L) contains(class(L),'RegressionOutputLayer','IgnoreCase',true), lgraph.Layers));
+    if ~isempty(regIdx)
+        lgraph = removeLayers(lgraph, lgraph.Layers(regIdx).Name);
+    end
+    dln = dlnetwork(lgraph);
+end
+
+%% ----- Build dlnetworks -----
+% Note: You need to run the above section first.
+dlnet_A  = to_dlnet(net);
+
+% ----- Minibatchqueues for neuronPCA (sampled train to speed up) -----
+mbSize = 48;
+stride = 10; subA = 1:stride:numel(Xtr);
+
+% Step A: raw Xtr
+dsA = arrayDatastore(Xtr(subA), "OutputType","same", "ReadSize", mbSize);
+mbqA = minibatchqueue(dsA, MiniBatchSize=mbSize, MiniBatchFormat="CTB", MiniBatchFcn=@(X) cat(3,X{:}));
+
+% ----- neuronPCA -----
+npca_A = neuronPCA(dlnet_A, mbqA);
+
+% ----- Prepare TEST batches -----
+dlXte_A = ctb(Xte);   % Step A uses raw inputs
+
+% Step B uses roll-forward, so no pre-built CTB (we'll feed per-sample inside roll)
+% But for baseline (non-roll) internal checks we stick to roll-forward path.
+
+Ytest = Yte(:);
+
+% ----- Baseline predictions (uncompressed) -----
+% Step A baseline
+yA_base = extractdata(reshape(predict(dlnet_A, dlXte_A), [],1));
+rmseA_base = stableRMSE(Ytest, yA_base);
+
+%% ----- Sweep compression levels for each model -----
+numValues = 20;
+explainedGoal = 1 - logspace(-3, 0, numValues);
+
+[A_stats, bestA] = sweepCompress(dlnet_A, npca_A, explainedGoal, ...
+    @(net_) extractdata(reshape(predict(net_, dlXte_A), [],1)), ...
+    Ytest, rmseA_base);
+
+% ----- Report -----
+fprintf('\n=== Step A Compression ===\n');
+reportBlock(A_stats, bestA, rmseA_base, dlnet_A);
+
+% ----- Plots -----
+figure('Name','Compression trade-offs','NumberTitle','off');
+%tiledlayout(2,2,'Padding','compact','TileSpacing','compact');
+
+nexttile; plot(A_stats.learnRed*100, A_stats.rmse,'o-'); hold on
+yline(rmseA_base,'--','Base RMSE');
+plot(A_stats.learnRed(bestA.idx)*100, A_stats.rmse(bestA.idx),'p','MarkerSize',12,'MarkerFaceColor','auto');
+xlabel('Learnables reduction (%)'); ylabel('RMSE'); title('Step A: RMSE vs reduction'); grid on
+ so 
+nexttile; plot(A_stats.learnRed*100, A_stats.expl,'o-'); hold on
+plot(A_stats.learnRed(bestA.idx)*100, A_stats.expl(bestA.idx),'p','MarkerSize',12,'MarkerFaceColor','auto');
+xlabel('Learnables reduction (%)'); ylabel('Explained variance'); title('Step A: EV vs reduction'); grid on
+
+%% ----- Save compressed models + metadata -----
+if ~exist('models','dir'), mkdir models; end
+
+bestNet_A = bestA.net; bestInfo_A = bestA.info;
+%bestNet_B = bestB.net; bestInfo_B = bestB.info;
+
+% Assuming variable `preproc` is still in your workspace.
+save(fullfile('models','DLmodel_LSTM_stepA_projected.mat'), ...
+    'bestNet_A','bestInfo_A','npca_A','explainedGoal', ...
+    'A_stats','rmseA_base','preproc','-v7.3');
+
+%% converting and creating the simulink models
+% Note: This section uploads the compressed network to SImulink and is only
+% needed if `StepA_model.slx` doesn't exist under the folder ´models´
+% If so: Make sure you add two inports later when running the
+% ´simulinkScript.m´ as this one constructs the data pipeline into the
+% Simulink blocks. 
+
+
+% IMPORTANT: unpack projection layers before export
+
+% netA_export = unpackProjectedLayers(bestNet_A);
+% mdlA = exportNetworkToSimulink(netA_export, ...
+%     ModelName="StepA_model", ModelPath="models", ...
+%     FrameBased=true, Stateful=false, OpenSystem=true);
+
+% save the models in simulink files
+% After exportNetworkToSimulink(...)
+% save_system('StepA_model', fullfile('models','StepA_model.slx'));
+
+%% ===== local functions (file-end) =====
+
+function [stats, best] = sweepCompress(dlnet, npca, goals, predictFcn, Ytest, rmse_base)
+    n = numel(goals);
+    expl = zeros(1,n); learnRed = zeros(1,n); rmse = zeros(1,n);
+    for i=1:n
+        [netP, info] = compressNetworkUsingProjection(dlnet, npca, ...
+            ExplainedVarianceGoal=goals(i), VerbosityLevel="off");
+        expl(i)     = info.ExplainedVariance;
+        learnRed(i) = info.LearnablesReduction;
+        yhat = predictFcn(netP);
+        rmse(i) = sqrt(mean((Ytest(:)-yhat(:)).^2));
+    end
+    tol = 1.03 * rmse_base;
+    ok = rmse <= tol;
+    if any(ok), [~,idx] = max(learnRed .* ok);
+    else,       [~,idx] = min(rmse);
+    end
+    [bestNet, bestInfo] = compressNetworkUsingProjection(dlnet, npca, ...
+        ExplainedVarianceGoal=goals(idx), VerbosityLevel="off");
+
+    stats = struct('expl',expl, 'learnRed',learnRed, 'rmse',rmse);
+    best = struct('idx',idx, 'net',bestNet, 'info',bestInfo);
+end
+
+function reportBlock(stats, best, rmse_base, dlnetOrig)
+    N_orig = sum(cellfun(@numel, dlnetOrig.Learnables.Value));
+    N_best = sum(cellfun(@numel, best.net.Learnables.Value));
+    redu   = 1 - N_best/N_orig;
+    rmse_best = stats.rmse(best.idx);
+    mae_best  = NaN; mape_best = NaN; % compute only if needed with target/preds (RMSE shown across sweep)
+
+    fprintf('Chosen EV=%.3f | LearnablesReduction=%.2f%% | RMSE=%.4f (base=%.4f, Δ=%.2f%%)\n', ...
+        stats.expl(best.idx), 100*stats.learnRed(best.idx), rmse_best, rmse_base, 100*(rmse_best/rmse_base-1));
+    fprintf('Learnables: original=%d, compressed=%d (%.2f%% reduction)\n', N_orig, N_best, 100*redu);
+end
+
+%% ===== local functions =====
+function out = asStrCol(s, field)
+    out = string([s.(field)]);
+end
+
+function out = asDblCol(s, field)
+    out = double([s.(field)]);
+end
+

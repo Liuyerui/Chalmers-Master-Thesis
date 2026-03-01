@@ -153,7 +153,7 @@ function T = normalizeToTable(raw)
 end
 
 function tt = loadXJTUFileToTimetable(filePath)
-    % 加载 .mat 文件
+    % 加载 .mat 文件 load '.mat' file
     raw = load(filePath);
     
     % XJTU 数据集包含在一个叫 'data' 或与文件名同名的结构体中
