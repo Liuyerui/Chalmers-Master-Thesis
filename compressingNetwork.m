@@ -1,6 +1,5 @@
 %% ----- helpers -----
-numLearnables = @(dlnet) sum(cellfun(@numel, dlnet.Learnables.Value)); % 统计一个 dlnetwork 里所有可训练参数（权重+偏置）
-% 的总数，用来后面对比"压缩前后参数量"。
+numLearnables = @(dlnet) sum(cellfun(@numel, dlnet.Learnables.Value));
 to_dlnet = @(net_) localToDLNetwork(net_);            % strips regression layer if present
 ctb = @(C) dlarray(cat(3, C{:}), "CTB");              % [F x W x N] → dlarray
 stableRMSE = @(y,yhat) sqrt(mean((y(:)-yhat(:)).^2));
@@ -202,7 +201,7 @@ nexttile; plot(A_stats.learnRed*100, A_stats.rmse,'o-'); hold on
 yline(rmseA_base,'--','Base RMSE');
 plot(A_stats.learnRed(bestA.idx)*100, A_stats.rmse(bestA.idx),'p','MarkerSize',12,'MarkerFaceColor','auto');
 xlabel('Learnables reduction (%)'); ylabel('RMSE'); title('Step A: RMSE vs reduction'); grid on
- so 
+
 nexttile; plot(A_stats.learnRed*100, A_stats.expl,'o-'); hold on
 plot(A_stats.learnRed(bestA.idx)*100, A_stats.expl(bestA.idx),'p','MarkerSize',12,'MarkerFaceColor','auto');
 xlabel('Learnables reduction (%)'); ylabel('Explained variance'); title('Step A: EV vs reduction'); grid on
@@ -228,17 +227,16 @@ save(fullfile('models','DLmodel_LSTM_stepA_projected.mat'), ...
 
 % IMPORTANT: unpack projection layers before export
 
-% netA_export = unpackProjectedLayers(bestNet_A);
-% mdlA = exportNetworkToSimulink(netA_export, ...
-%     ModelName="StepA_model", ModelPath="models", ...
-%     FrameBased=true, Stateful=false, OpenSystem=true);
+netA_export = unpackProjectedLayers(bestNet_A);
+mdlA = exportNetworkToSimulink(netA_export, ...
+    ModelName="StepA_model", ModelPath="models", ...
+    FrameBased=true, Stateful=false, OpenSystem=true);
 
-% save the models in simulink files
-% After exportNetworkToSimulink(...)
-% save_system('StepA_model', fullfile('models','StepA_model.slx'));
+save the models in simulink files
+After exportNetworkToSimulink(...)
+save_system('StepA_model', fullfile('models','StepA_model.slx'));
 
 %% ===== local functions (file-end) =====
-% real prunning and quantization part of the entire code
 
 function [stats, best] = sweepCompress(dlnet, npca, goals, predictFcn, Ytest, rmse_base)
     n = numel(goals);
@@ -283,4 +281,3 @@ end
 function out = asDblCol(s, field)
     out = double([s.(field)]);
 end
-

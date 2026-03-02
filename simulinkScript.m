@@ -1,14 +1,14 @@
 %% Ensure the right model is loaded (no shadowing) and open it
 bdclose all
 
-addpath('/Users/axel/Documents/HandOver/Matlab/models','-begin');
+addpath('E:/Master thesis Matlab/models','-begin');
 rehash path
 
-open_system('/Users/axel/Documents/HandOver/Matlab/models/StepA_model.slx');
+open_system('E:/Master thesis Matlab/models/StepA_model.slx');
 mdl = 'StepA_model';
 
 % sanity: verify file path of the loaded model is yours
-assert(contains(get_param(mdl,'FileName'), '/models/'), ...
+assert(contains(get_param(mdl,'FileName'), '\models\'), ...
     'Shadowed model still active on path');
 
 
@@ -41,7 +41,7 @@ ds = setElement(ds,2,trueSoH);
 % Note there is some sort of scaling or offset error in this current
 % version and there should be and easy fix. 
 %Simulate the model and export the simulation output to the workspace
-mdlPath = "/Users/axel/Documents/HandOver/Matlab/models/StepA_model.slx";
+mdlPath = "E:/Master thesis Matlab/models/StepA_model.slx";
 in = Simulink.SimulationInput(mdlPath);
 in = in.setModelParameter("StopTime",'steps');
 in = in.setModelParameter("FixedStep",'Ts');
