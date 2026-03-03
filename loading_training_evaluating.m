@@ -107,21 +107,48 @@ opts = trainingOptions('adam', ...
 % net = trainNetwork(Xtr, Ytr, layers, opts);
 
 % 5. 开始训练
-net = trainnet(Xtr, Ytr, net, @adaptiveMSE, opts);
+net = trainnet(Xtr, Ytr, net, @robustMSE, opts);
 
 %% Step A  Evaluate (with stable MAPE)
-pred = customPredict(net, Xte, 64);
-
-% 转换格式：minibatchpredict 可能返回 dlarray，需要转回普通数组
-if isdlarray(pred)
-    pred = extractdata(pred);
+% 1. 手动将测试集转换为 dlarray (CTB 格式)
+% Xte 是 Cell Array，我们需要把它堆叠成一个 3D 数组 [Channel, Time, Batch]
+try
+    % 尝试直接堆叠 (假设所有序列长度一致 W=5)
+    Xte_mat = cat(3, Xte{:}); 
+    dlXte = dlarray(Xte_mat, 'CTB');
+catch
+    error('Xte 中的序列长度不一致，无法直接堆叠进行批量预测。');
 end
 
-% 确保维度匹配 (防止是 [1, N] 而不是 [N, 1])
-if size(pred, 1) < size(pred, 2)
-    pred = pred';
+% 2. 直接使用 predict (避开 minibatchpredict 的标签检查)
+% predict 会根据输入的一次性算出结果。由于测试集通常不大，内存应该够用。
+% 如果测试集非常大导致内存溢出，需要手写 for 循环分批 predict。
+dlYPred = predict(net, dlXte);
+
+% 3. 极其暴力的后处理 (忽略所有维度标签)
+% 无论输出是 "CT"、"CB" 还是 "BC"，我们只关心里面的数值
+YPred_raw = extractdata(stripdims(dlYPred));
+
+% 4. 强制展平为列向量
+pred = double(YPred_raw(:)); 
+Yte_vec = double(Yte(:));
+
+% 5. 维度完整性检查 (防止顺序乱了)
+% 如果 pred 的元素数量和 Yte 不一致，说明模型输出维度不仅是标签错了，形状也错了
+if numel(pred) ~= numel(Yte_vec)
+    warning('预测结果数量 (%d) 与 测试集标签数量 (%d) 不匹配！尝试转置...', numel(pred), numel(Yte_vec));
+    % 这种情况下通常不会发生，除非模型输出是序列对序列 (Seq2Seq) 而不是序列对一
+    % 如果发生了，通常取最后一个时间步
+    if size(YPred_raw, 2) == numel(Yte_vec)
+         pred = double(YPred_raw');
+    elseif size(YPred_raw, 1) == numel(Yte_vec)
+         pred = double(YPred_raw);
+    else
+         error('无法匹配预测结果与标签的维度。模型输出形状: %s', mat2str(size(YPred_raw)));
+    end
 end
 
+% 6. 计算指标
 mae  = mean(abs(pred - Yte));
 rmse = sqrt(mean((pred - Yte).^2));
 epsMape = 1e-8;
@@ -278,42 +305,25 @@ end
 
 %%
 % 定义自适应损失函数
-function loss = adaptiveMSE(Y, T)
-    % Y: 网络输出，可能是 [1×B] 格式 CT
-    % T: 目标值 [B×1] 格式 BC
+function loss = robustMSE(Y, T)
+    % Y: 网络预测输出 (dlarray)
+    % T: 真实标签 (dlarray)
     
-    % 步骤1: 提取数据（暂时切断自动微分）
-    Ydata = extractdata(Y);
-    Tdata = extractdata(T);
+    % 1. 去除维度标签 (Strip Dimension Labels)
+    % stripdims 不会切断梯度，只是移除 'C', 'B', 'T' 这些元数据
+    Y_raw = stripdims(Y);
+    T_raw = stripdims(T);
     
-    % 步骤2: 确保 Y 是列向量
-    Ydata = Ydata(:);
-    Tdata = Tdata(:);
+    % 2. 维度对齐
+    % PyTorch 导入的模型通常输出 [1, Batch] 或 [Batch, 1]
+    % 我们将它们统一 reshape 成列向量 [N, 1] 以便相减
+    Y_vec = reshape(Y_raw, [], 1);
+    T_vec = reshape(T_raw, [], 1);
     
-    % 步骤3: 计算 MSE（数值计算）
-    mse_value = mean((Ydata - Tdata).^2);
-    
-    % 步骤4: 重新包装为 dlarray，重新连接计算图
-    % 注意：这里使用 dlarray(mse_value) 会创建一个新的计算图起点
-    % 但由于 mse_value 是从 Ydata 和 Tdata 计算得来的数值，
-    % 而 Ydata 是从 Y 提取的，梯度信息已经丢失
-    
-    % 正确方法：使用原始 Y 和 T 重新计算 MSE，但确保格式正确
-    % 重新创建格式正确的 dlarray 用于梯度计算
-    if strcmp(dims(Y), 'CT') && size(Y, 1) == 1
-        % 手动创建正确的格式
-        B = size(Y, 2);  % 批量大小
-        Y_correct = dlarray(zeros(B, 1), 'BC');
-        % 将 Y 的值赋给 Y_correct
-        Y_correct = dlarray(extractdata(Y)', 'BC');
-    else
-        Y_correct = Y;
-    end
-    
-    % 现在格式正确，重新计算 MSE 以保持梯度
-    loss = mse(Y_correct, T);
+    % 3. 计算 MSE
+    % 这里的运算都是在 dlarray 上进行的，梯度链条完好无损
+    loss = mean((Y_vec - T_vec).^2);
 end
-
 % 定义自定义预测函数
 function Ypred = customPredict(net, X, mbSize)
     numSamples = length(X);
